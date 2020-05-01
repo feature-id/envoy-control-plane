@@ -74,12 +74,12 @@ var (
 )
 
 func init() {
-	flag.BoolVar(&ads, "ads", false, "Use ads mode (default: false, means we are using xds).")
-	flag.BoolVar(&debug, "debug", false, "Use debug logging (default: false).")
-	flag.StringVar(&nodeID, "nodeID", "test-id", "Node ID (default: test-id).")
-	flag.UintVar(&port, "port", 18000, "Management server port (default: 1800).")
-	flag.StringVar(&watchedDirs, "watch", "", "Dirs to watch for changes (default: '').")
-	flag.StringVar(&metricsServerAddr, "metricsServerAddr", ":2112", "Address and port for metrics endpoint (default: ':2112').")
+	flag.BoolVar(&ads, "ads", false, "Use ads mode. (default: false, means we are using xds)")
+	flag.BoolVar(&debug, "debug", false, "Use debug logging.")
+	flag.StringVar(&nodeID, "nodeID", "test-id", "Node ID.")
+	flag.UintVar(&port, "port", 18000, "Management server port.")
+	flag.StringVar(&watchedDirs, "watch", "", "Dirs to watch for changes.")
+	flag.StringVar(&metricsServerAddr, "metricsServerAddr", ":2112", "Address and port for metrics endpoint.")
 }
 
 // This feels kinda dumb.
@@ -98,7 +98,7 @@ func (logger logger) Debugf(format string, args ...interface{}) {
 }
 // end of logger stuff
 
-// RunManagementServer starts an xDS server at the given port.
+// runManagementServer starts an xDS server at the given port.
 func runManagementServer(ctx context.Context, srv xds.Server, port uint) {
 	// gRPC golang library sets a very small upper bound for the number gRPC/h2
 	// streams over a single TCP connection. If a proxy multiplexes requests over
