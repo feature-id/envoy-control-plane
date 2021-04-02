@@ -6,7 +6,7 @@ package main
  * Based on Ambassador's Ambex ADS and massively
  * modified to extend its functionality.
  * **********************************************
-*/
+ */
 
 import (
 	"bufio"
@@ -25,6 +25,10 @@ import (
 	"syscall"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/golang/protobuf/jsonpb"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/ptypes"
+	"github.com/golang/protobuf/ptypes/any"
 	"google.golang.org/grpc"
 
 	log "github.com/sirupsen/logrus"
@@ -33,22 +37,60 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	auth "github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
-	bootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
-	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
-	cache "github.com/envoyproxy/go-control-plane/pkg/cache"
-	xds "github.com/envoyproxy/go-control-plane/pkg/server"
+	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
+	listenerservice "github.com/envoyproxy/go-control-plane/envoy/service/listener/v3"
+	routeservice "github.com/envoyproxy/go-control-plane/envoy/service/route/v3"
+	runtimeservice "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
+	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	xds "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/any"
+	bootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	listener "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	route "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	secret "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	runtime "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
+
+	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
+	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
 
 	// envoy internal typed objects
-	_ "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v2"
-	_ "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/lua/v2"
-	_ "github.com/envoyproxy/go-control-plane/envoy/config/filter/http/rbac/v2"
+	_ "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/config/overload/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/file/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/compression/gzip/compressor/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/compression/gzip/decompressor/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/adaptive_concurrency/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/buffer/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/compressor/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/cors/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/csrf/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/decompressor/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ext_authz/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/fault/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/gzip/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/header_to_metadata/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/health_check/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ip_tagging/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/lua/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/original_src/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ratelimit/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/squash/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/http_inspector/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/original_dst/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/original_src/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/proxy_protocol/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/tls_inspector/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/direct_response/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/ext_authz/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
 )
 
 var (
@@ -58,8 +100,6 @@ var (
 	nodeID              string
 	port                uint
 	watchedDirs         string
-
-	Version = "-no-version-" // Version is inserted at build using --ldflags -X
 )
 
 var (
@@ -69,21 +109,23 @@ var (
 	})
 	snapshotTransparentVersion = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "ecp_snapshot_transparent_version",
-		Help: "Configuration snapshot version, taken from data configs.",
+		Help: "Version of configuration snapshot, taken from data storage.",
 	})
 )
 
 func init() {
-	flag.BoolVar(&ads, "ads", false, "Use ads mode. (default: false, means we are using xds)")
-	flag.BoolVar(&debug, "debug", false, "Use debug logging.")
-	flag.StringVar(&nodeID, "nodeID", "test-id", "Node ID.")
+	flag.BoolVar(&ads, "ads", false, "Enable ads mode (default: false, means we are using xds)")
+	flag.BoolVar(&debug, "debug", false, "Use debug logging (default: false)")
+	flag.StringVar(&nodeID, "nodeID", "test-id", "Node ID")
 	flag.UintVar(&port, "port", 18000, "Management server port.")
-	flag.StringVar(&watchedDirs, "watch", "", "Dirs to watch for changes.")
-	flag.StringVar(&metricsServerAddr, "metricsServerAddr", ":2112", "Address and port for metrics endpoint.")
+	flag.StringVar(&watchedDirs, "watch", "", "Dirs to watch for changes (default: current directory)")
+	flag.StringVar(&metricsServerAddr, "metricsServerAddr", ":2112",
+		"Address:port for prometheus metrics endpoint")
 }
 
-// This feels kinda dumb.
+// This feels kinda dumb. ¯\_(ツ)_/¯
 type logger struct{}
+
 func (logger logger) Infof(format string, args ...interface{}) {
 	log.Infof(format, args...)
 }
@@ -98,13 +140,27 @@ func (logger logger) Debugf(format string, args ...interface{}) {
 }
 // end of logger stuff
 
-// runManagementServer starts an xDS server at the given port.
-func runManagementServer(ctx context.Context, srv xds.Server, port uint) {
+const (
 	// gRPC golang library sets a very small upper bound for the number gRPC/h2
 	// streams over a single TCP connection. If a proxy multiplexes requests over
 	// a single connection to the management server, then it might lead to
 	// availability problems.
-	const grpcMaxConcurrentStreams = 1000000
+	grpcMaxConcurrentStreams = 1000000
+)
+
+func registerServer(grpcServer *grpc.Server, srv xds.Server) {
+	discovery.RegisterAggregatedDiscoveryServiceServer(grpcServer, srv)
+	endpointservice.RegisterEndpointDiscoveryServiceServer(grpcServer, srv)
+	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, srv)
+	routeservice.RegisterRouteDiscoveryServiceServer(grpcServer, srv)
+	listenerservice.RegisterListenerDiscoveryServiceServer(grpcServer, srv)
+	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, srv)
+	runtimeservice.RegisterRuntimeDiscoveryServiceServer(grpcServer, srv)
+}
+
+// runManagementServer starts an xDS server at the given port.
+func runManagementServer(ctx context.Context, srv xds.Server, port uint) {
+
 	var grpcOptions []grpc.ServerOption
 	grpcOptions = append(grpcOptions, grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams))
 	grpcServer := grpc.NewServer(grpcOptions...)
@@ -114,32 +170,23 @@ func runManagementServer(ctx context.Context, srv xds.Server, port uint) {
 		log.WithError(err).Fatal("failed to listen")
 	}
 
-	// register services
-	discovery.RegisterAggregatedDiscoveryServiceServer(grpcServer, srv)
-	v2.RegisterEndpointDiscoveryServiceServer(grpcServer, srv)
-	v2.RegisterClusterDiscoveryServiceServer(grpcServer, srv)
-	v2.RegisterRouteDiscoveryServiceServer(grpcServer, srv)
-	v2.RegisterListenerDiscoveryServiceServer(grpcServer, srv)
-	discovery.RegisterSecretDiscoveryServiceServer(grpcServer, srv)
-	discovery.RegisterRuntimeDiscoveryServiceServer(grpcServer, srv)
+	registerServer(grpcServer, srv)
 
-	log.WithFields(log.Fields{"port": port}).Info("Listening")
+	log.WithFields(log.Fields{"port": port}).Info("Listening at")
+
 	go func() {
 		go func() {
-			err := grpcServer.Serve(lis)
-
-			if err != nil {
+			if err = grpcServer.Serve(lis); err != nil {
 				log.WithFields(log.Fields{"error": err}).Error("Management server exited.")
 			}
 		}()
-
 		<-ctx.Done()
 		grpcServer.GracefulStop()
 	}()
 
 }
 
-// Start /metrics endpoint
+// runMetricsServer starts /metrics endpoint at metricsServerAddr
 func runMetricsServer (ctx context.Context, metricsServerAddr string) {
 	go func() {
 		go func() {
@@ -184,11 +231,11 @@ type Validatable interface {
 
 func getConfigVersion(name string) (int, error) {
 	fd, err := os.Open(name)
-	defer fd.Close()
 	if err != nil {
 		log.Errorf("Error opening file %s: %v", name, err)
 		return -1, err
 	}
+	defer fd.Close()
 
 	scanner := bufio.NewScanner(fd)
 	if !scanner.Scan() {
@@ -197,11 +244,11 @@ func getConfigVersion(name string) (int, error) {
 	}
 	contentInt, err := strconv.Atoi(scanner.Text())
 	if err != nil {
-		log.Errorf("Error converting snapshot version to Int.", err)
+		log.Errorf("Error converting snapshot version to Int: %v", err)
 		return -1, err
 	}
 
-	log.Debugf("Got snapshot version %s", contentInt)
+	log.Debugf("Got snapshot version %d", contentInt)
 	return contentInt, nil
 }
 
@@ -266,12 +313,12 @@ func mergeResource(to, from proto.Message) {
 }
 
 func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int, dirs []string) {
-	clusters := []cache.Resource{}  // v2.Cluster
-	endpoints := []cache.Resource{} // v2.ClusterLoadAssignment
-	routes := []cache.Resource{}    // v2.RouteConfiguration
-	listeners := []cache.Resource{} // v2.Listener
-	secrets := []cache.Resource{} // auth.Secret
-	runtimes := []cache.Resource{} // discovery.Runtime
+	var clusters []types.Resource
+	var endpoints []types.Resource
+	var routes []types.Resource
+	var listeners []types.Resource
+	var secrets []types.Resource
+	var runtimes []types.Resource
 
 	// Configs on disk to get our resources from.
 	var filenames []string
@@ -304,30 +351,30 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 		}
 
 		// Array of the resulting objects:
-		var outObjects *[]cache.Resource
+		var outObjects *[]types.Resource
 
 		// Objects' type selector
 		switch decodedObjects.(type) {
-		case *v2.Cluster:
+		case *cluster.Cluster:
 			outObjects = &clusters
-		case *v2.ClusterLoadAssignment:
+		case *endpoint.ClusterLoadAssignment:
 			outObjects = &endpoints
-		case *v2.RouteConfiguration:
+		case *route.RouteConfiguration:
 			outObjects = &routes
-		case *v2.Listener:
+		case *listener.Listener:
 			outObjects = &listeners
-		case *auth.Secret:
+		case *secret.Secret:
 			outObjects = &secrets
-		case *discovery.Runtime:
+		case *runtime.Runtime:
 			outObjects = &runtimes
 		case *bootstrap.Bootstrap: // static configuration
 			bootstrapResource := decodedObjects.(*bootstrap.Bootstrap)
 			staticResource := bootstrapResource.StaticResources
-			for _, listener := range staticResource.Listeners {
-				listeners = append(listeners, cloneResource(listener).(cache.Resource))
+			for _, listenerResource := range staticResource.Listeners {
+				listeners = append(listeners, cloneResource(listenerResource).(types.Resource))
 			}
-			for _, cluster := range staticResource.Clusters {
-				clusters = append(clusters, cloneResource(cluster).(cache.Resource))
+			for _, clusterResource := range staticResource.Clusters {
+				clusters = append(clusters, cloneResource(clusterResource).(types.Resource))
 			}
 			continue
 		default:
@@ -335,18 +382,14 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 			continue
 		}
 
-		// to do: config_dump
-		*outObjects = append(*outObjects, decodedObjects.(cache.Resource))
+		// I have no idea why does ambex need this list, maybe for config dump?
+		// (however, it is not implemented anywhere around)
+		// todo: make viewable config dump
+		*outObjects = append(*outObjects, decodedObjects.(types.Resource))
 	}
 
 	version := fmt.Sprintf("v%d", *snapshotVersion)
-	snapshot := cache.NewSnapshot(version, endpoints, clusters, routes, listeners, runtimes)
-
-	if secrets != nil {
-		snapshot.Resources[cache.Secret] = cache.NewResources(version, secrets)
-	} else {
-		log.Debugf("No secrets given. %+v", secrets)
-	}
+	snapshot := cache.NewSnapshot(version, endpoints, clusters, routes, listeners, runtimes, secrets)
 
 	// Consistent check verifies that the dependent resources are exactly listed in the
 	// snapshot:
@@ -359,8 +402,11 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 	err := snapshot.Consistent()
 	if err != nil {
 		snapshotCreateFailures.Inc()
-		log.Errorf("Snapshot inconsistency: %+v\n", snapshot)
-	} else { // this looks like if-spaghetti
+		log.Errorf("Snapshot inconsistency. Error: %+v\n", err)
+		if debug {
+			log.Debugf("Failed snapshot: %+v\n", snapshot) // todo: format this horrible output
+		}
+	} else {
 		if err := config.SetSnapshot(nodeID, snapshot); err != nil {
 			log.Fatalf("Fatal error while trying to set snapshot. Error: %q. Snapshot: %+v\n", err, snapshot)
 		} else {
@@ -373,9 +419,9 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 }
 
 // OnStreamOpen is called once an xDS stream is open with a stream ID and the type URL (or "" for ADS).
-func (logger logger) OnStreamOpen(_ context.Context, id int64, stype string) error {
+func (logger logger) OnStreamOpen(_ context.Context, id int64, typ string) error {
 	if debug {
-		log.Debugf("Stream[%d] is open for '%s' (can be empty for ADS).\n", id, stype)
+		log.Debugf("Stream[%d] is open for '%s' (can be empty for ADS).\n", id, typ)
 	}
 	return nil
 }
@@ -388,13 +434,13 @@ func (logger logger) OnStreamClosed(id int64) {
 }
 
 // OnStreamRequest is called once a request is received on a stream.
-func (logger logger) OnStreamRequest(id int64, req *v2.DiscoveryRequest) error {
+func (logger logger) OnStreamRequest(id int64, req *discovery.DiscoveryRequest) error {
 	log.Infof("Stream[%d] request: %v", id, req)
 	return nil
 }
 
 // OnStreamResponse is called immediately prior to sending a response on a stream.
-func (logger logger) OnStreamResponse(id int64, req *v2.DiscoveryRequest, res *v2.DiscoveryResponse) {
+func (logger logger) OnStreamResponse(id int64, req *discovery.DiscoveryRequest, res *discovery.DiscoveryResponse) {
 	if debug {
 		log.Debugf("Stream[%d] response: %v -> %v", id, req, res)
 	} else {
@@ -403,13 +449,13 @@ func (logger logger) OnStreamResponse(id int64, req *v2.DiscoveryRequest, res *v
 }
 
 // OnFetchRequest is called for each Fetch request
-func (logger logger) OnFetchRequest(_ context.Context, req *v2.DiscoveryRequest) error {
+func (logger logger) OnFetchRequest(_ context.Context, req *discovery.DiscoveryRequest) error {
 	log.Infof("Fetch request: %v", req)
 	return nil
 }
 
 // OnFetchResponse is called immediately prior to sending a response.
-func (logger logger) OnFetchResponse(req *v2.DiscoveryRequest, res *v2.DiscoveryResponse) {
+func (logger logger) OnFetchResponse(req *discovery.DiscoveryRequest, res *discovery.DiscoveryResponse) {
 	if debug {
 		log.Debugf("Fetch response: %v -> %v", req, res)
 	} else {
@@ -425,18 +471,17 @@ func main() {
 		log.SetLevel(log.DebugLevel)
 	}
 
-	log.Infof("Envoy control plane (version: %s) is starting...", Version)
+	log.Info("Envoy control plane is starting...")
 
-	// Get dirs with data configuration. They are not watched, unless specified in 'watcherDirs' arg.
+	// Get dirs with configuration for ambex. They are not watched, unless specified in 'watcherDirs' arg.
 	// If not specified, looking in current directory.
-	dataConfigs := flag.Args()
-	if len(dataConfigs) == 0 {
-		dataConfigs = []string{"."}
+	ambexDataConfigs := flag.Args()
+	if len(ambexDataConfigs) == 0 {
+		ambexDataConfigs = []string{"."}
 	}
 
 	// Data files watcher stuff
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
+	watcher, err := fsnotify.NewWatcher(); if err != nil {
 		log.WithError(err).Fatal()
 	}
 	defer watcher.Close()
@@ -482,7 +527,7 @@ func main() {
 	pid := os.Getpid()
 	file := "ecp.pid"
 	if err := ioutil.WriteFile(file, []byte(fmt.Sprintf("%v", pid)), 0644); err != nil {
-		log.Warnf("Cannot write PID-file %s for pid %s.", file, pid)
+		log.Warnf("Cannot write PID-file %s for pid %d.", file, pid)
 	} else {
 		log.WithFields(log.Fields{"pid": pid, "file": file}).Info("Wrote PID")
 	}
@@ -490,7 +535,7 @@ func main() {
 	snapshotVersion := 0
 
 	// Read our data files and convert it to objects
-	createResourcesFromConfig(config, &snapshotVersion, dataConfigs)
+	createResourcesFromConfig(config, &snapshotVersion, ambexDataConfigs)
 
 OUTER:
 	for {
@@ -498,19 +543,19 @@ OUTER:
 		case sig := <-ch:
 			switch sig {
 			case syscall.SIGHUP: // reload objects from data files on SIGHUP
-				log.Infof("Got SIGHUP. Dirs: %+v",dataConfigs)
-				createResourcesFromConfig(config, &snapshotVersion, dataConfigs)
+				log.Infof("Got SIGHUP. Dirs: %+v",ambexDataConfigs)
+				createResourcesFromConfig(config, &snapshotVersion, ambexDataConfigs)
 			case os.Interrupt, syscall.SIGTERM: // exit on SIGTERM
 				break OUTER
 			}
 		case event := <-watcher.Events:
 			log.Infof("Got watcher event: %s: %s", event.Op, event.Name)
-			createResourcesFromConfig(config, &snapshotVersion, dataConfigs)
+			createResourcesFromConfig(config, &snapshotVersion, ambexDataConfigs)
 		case err := <-watcher.Errors:
 			log.WithError(err).Warn("Watcher error.")
 		}
 	}
 
-	log.Info("Envoy control plane exited.")
+	log.Info("Management server exited.")
 
 }
