@@ -1,9 +1,14 @@
 # envoy-control-plane changelog
 
+03.05.2022
+- Updated go-control-plane to v0.10.2-0.20220223230838-5291202281ab (works with envoy 1.21.1 release).
+- Switched from github.com/golang/protobuf to google.golang.org/protobuf.
+- Switched to Go 1.17
+
 02.04.2021
 - Switched to envoy APIv3.
 - Removed custom SDS support, because it is now included in go-control-plane.
-- Updated go-control-plane to v0.9.7-0.20200713194620-000e06b258c1 (works with envoy 1.15.0 release)
+- Updated go-control-plane to v0.9.7-0.20200713194620-000e06b258c1 (works with envoy 1.15.0 release).
 
 26.02.2020
 - Added SDS support / secrets management.

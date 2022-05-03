@@ -11,6 +11,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -23,13 +25,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/golang/protobuf/jsonpb"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	"github.com/golang/protobuf/ptypes/any"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 
 	log "github.com/sirupsen/logrus"
 
@@ -38,13 +41,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	clusterservice "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
-	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
 	endpointservice "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
 	listenerservice "github.com/envoyproxy/go-control-plane/envoy/service/listener/v3"
 	routeservice "github.com/envoyproxy/go-control-plane/envoy/service/route/v3"
 	runtimeservice "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
 	secretservice "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
-	xds "github.com/envoyproxy/go-control-plane/pkg/server/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/server/v3"
 
 	bootstrap "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v3"
 	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -56,6 +59,8 @@ import (
 
 	"github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	"github.com/envoyproxy/go-control-plane/pkg/cache/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/resource/v3"
+	_ "github.com/envoyproxy/go-control-plane/pkg/wellknown"
 
 	// envoy internal typed objects
 	_ "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
@@ -80,7 +85,6 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/ratelimit/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/rbac/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/router/v3"
-	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/http/squash/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/http_inspector/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/original_dst/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/listener/original_src/v3"
@@ -90,7 +94,9 @@ import (
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/ext_authz/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/rbac/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/retry/priority/previous_priorities/v3"
 	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	_ "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 )
 
 var (
@@ -146,22 +152,38 @@ const (
 	// a single connection to the management server, then it might lead to
 	// availability problems.
 	grpcMaxConcurrentStreams = 1000000
+	// Keepalive timeouts based on connection_keepalive parameter
+	// https://www.envoyproxy.io/docs/envoy/latest/configuration/overview/examples#dynamic
+	grpcKeepaliveTime        = 30 * time.Second
+	grpcKeepaliveTimeout     = 5 * time.Second
+	grpcKeepaliveMinTime     = 30 * time.Second
 )
 
-func registerServer(grpcServer *grpc.Server, srv xds.Server) {
-	discovery.RegisterAggregatedDiscoveryServiceServer(grpcServer, srv)
-	endpointservice.RegisterEndpointDiscoveryServiceServer(grpcServer, srv)
-	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, srv)
-	routeservice.RegisterRouteDiscoveryServiceServer(grpcServer, srv)
-	listenerservice.RegisterListenerDiscoveryServiceServer(grpcServer, srv)
-	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, srv)
-	runtimeservice.RegisterRuntimeDiscoveryServiceServer(grpcServer, srv)
+func registerServer(grpcServer *grpc.Server, server server.Server) {
+	discoverygrpc.RegisterAggregatedDiscoveryServiceServer(grpcServer, server)
+	endpointservice.RegisterEndpointDiscoveryServiceServer(grpcServer, server)
+	clusterservice.RegisterClusterDiscoveryServiceServer(grpcServer, server)
+	routeservice.RegisterRouteDiscoveryServiceServer(grpcServer, server)
+	listenerservice.RegisterListenerDiscoveryServiceServer(grpcServer, server)
+	secretservice.RegisterSecretDiscoveryServiceServer(grpcServer, server)
+	runtimeservice.RegisterRuntimeDiscoveryServiceServer(grpcServer, server)
 }
 
 // runManagementServer starts an xDS server at the given port.
-func runManagementServer(ctx context.Context, srv xds.Server, port uint) {
+func runManagementServer(ctx context.Context, srv server.Server, port uint) {
 
 	var grpcOptions []grpc.ServerOption
+	grpcOptions = append(grpcOptions,
+		grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    grpcKeepaliveTime,
+			Timeout: grpcKeepaliveTimeout,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             grpcKeepaliveMinTime,
+			PermitWithoutStream: true,
+		}),
+	)
 	grpcOptions = append(grpcOptions, grpc.MaxConcurrentStreams(grpcMaxConcurrentStreams))
 	grpcServer := grpc.NewServer(grpcOptions...)
 
@@ -205,10 +227,11 @@ func runMetricsServer (ctx context.Context, metricsServerAddr string) {
 
 // Decoders for unmarshalling config, that ambex was fed with.
 // They can be in JSON or protobuf format.
-var decoders = map[string]func(string, proto.Message) error{
-	".json": jsonpb.UnmarshalString,
-	".pb":   proto.UnmarshalText,
+var decoders = map[string]func([]byte, proto.Message) error{
+	".json": protojson.Unmarshal,
+	//".pb":   proto.Unmarshal,
 }
+
 
 // Check if we have supported decoder for our data files (by their extension, lol)
 func isDecodable(name string) bool {
@@ -254,7 +277,7 @@ func getConfigVersion(name string) (int, error) {
 
 // Decoding our config into proto.Message objects
 func DecodeConfigFile(name string) (proto.Message, error) {
-	localAny := &any.Any{}
+	var decodedContents anypb.Any
 
 	// Reading config file with data
 	contents, err := ioutil.ReadFile(name)
@@ -266,21 +289,25 @@ func DecodeConfigFile(name string) (proto.Message, error) {
 	// Decoding data given.
 	ext := filepath.Ext(name)
 	decoder := decoders[ext]
-	err = decoder(string(contents), localAny)
+	err = decoder(contents, &decodedContents)
 	if err != nil {
 		log.Errorf("Decoder error for file: %s ", name)
 		return nil, err
 	}
 
 	// Casting protobuf and custom envoy api objects stuff
-	var m ptypes.DynamicAny
-	err = ptypes.UnmarshalAny(localAny, &m)
+	m, err := decodedContents.UnmarshalNew()
 	if err != nil {
-		log.Errorf("Error UnmarshalAny in file: %s", name)
+		log.Errorf("Error UnmarshalNew in file %s: %v", name, err)
 		return nil, err
 	}
 
-	var v = m.Message.(Validatable)
+	var v, ok = m.(Validatable)
+	if !ok {
+		var castingErrorText = "error casting message to Validatable() interface"
+		log.Errorf("%v", castingErrorText)
+		return nil, errors.New(castingErrorText)
+	}
 
 	err = v.Validate()
 	if err != nil {
@@ -302,11 +329,11 @@ func cloneResource(src proto.Message) proto.Message {
 	return dst
 }
 func mergeResource(to, from proto.Message) {
-	str, err := (&jsonpb.Marshaler{}).MarshalToString(from)
+	fromInBytes, err := protojson.Marshal(from)
 	if err != nil {
 		panic(err)
 	}
-	err = jsonpb.UnmarshalString(str, to)
+	err = protojson.Unmarshal(fromInBytes, to)
 	if err != nil {
 		panic(err)
 	}
@@ -319,6 +346,8 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 	var listeners []types.Resource
 	var secrets []types.Resource
 	var runtimes []types.Resource
+	var scopedroutes []types.Resource
+	var extensionconfigs []types.Resource
 
 	// Configs on disk to get our resources from.
 	var filenames []string
@@ -371,6 +400,8 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 			bootstrapResource := decodedObjects.(*bootstrap.Bootstrap)
 			staticResource := bootstrapResource.StaticResources
 			for _, listenerResource := range staticResource.Listeners {
+				// This cloning and clusters' one below are very similar to proto.Clone(),
+				// but we don't know for sure why authors use their own implementation.
 				listeners = append(listeners, cloneResource(listenerResource).(types.Resource))
 			}
 			for _, clusterResource := range staticResource.Clusters {
@@ -378,7 +409,7 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 			}
 			continue
 		default:
-			log.Warnf("Unrecognized resource %s: %v", name, err)
+			log.Warnf("Unrecognized resource: %s", name)
 			continue
 		}
 
@@ -389,7 +420,16 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 	}
 
 	version := fmt.Sprintf("v%d", *snapshotVersion)
-	snapshot := cache.NewSnapshot(version, endpoints, clusters, routes, listeners, runtimes, secrets)
+	snapshot, _ := cache.NewSnapshot(version, map[resource.Type][]types.Resource{
+		resource.EndpointType:        endpoints,
+		resource.ClusterType:         clusters,
+		resource.RouteType:           routes,
+		resource.ScopedRouteType:     scopedroutes,
+		resource.ListenerType:        listeners,
+		resource.RuntimeType:         runtimes,
+		resource.SecretType:          secrets,
+		resource.ExtensionConfigType: extensionconfigs,
+	})
 
 	// Consistent check verifies that the dependent resources are exactly listed in the
 	// snapshot:
@@ -404,10 +444,17 @@ func createResourcesFromConfig(config cache.SnapshotCache, snapshotVersion *int,
 		snapshotCreateFailures.Inc()
 		log.Errorf("Snapshot inconsistency. Error: %+v\n", err)
 		if debug {
-			log.Debugf("Failed snapshot: %+v\n", snapshot) // todo: format this horrible output
+			// Trying to print pretty snapshot json
+			prettySnapshot, errMarshalIndent := json.MarshalIndent(snapshot, "", "\t")
+			if errMarshalIndent != nil {
+				log.Debugf("Error making pretty snapshot: %+v\n", errMarshalIndent)
+				log.Debugf("Failed snapshot: %+v\n", snapshot)
+			} else {
+				log.Debugf("Failed snapshot: %+v\n", prettySnapshot)
+			}
 		}
 	} else {
-		if err := config.SetSnapshot(nodeID, snapshot); err != nil {
+		if err := config.SetSnapshot(context.Background(), nodeID, snapshot); err != nil {
 			log.Fatalf("Fatal error while trying to set snapshot. Error: %q. Snapshot: %+v\n", err, snapshot)
 		} else {
 			f := float64(*snapshotVersion)
@@ -434,13 +481,14 @@ func (logger logger) OnStreamClosed(id int64) {
 }
 
 // OnStreamRequest is called once a request is received on a stream.
-func (logger logger) OnStreamRequest(id int64, req *discovery.DiscoveryRequest) error {
+func (logger logger) OnStreamRequest(id int64, req *discoverygrpc.DiscoveryRequest) error {
 	log.Infof("Stream[%d] request: %v", id, req)
 	return nil
 }
 
 // OnStreamResponse is called immediately prior to sending a response on a stream.
-func (logger logger) OnStreamResponse(id int64, req *discovery.DiscoveryRequest, res *discovery.DiscoveryResponse) {
+func (logger logger) OnStreamResponse(id int64, req *discoverygrpc.DiscoveryRequest,
+	res *discoverygrpc.DiscoveryResponse) {
 	if debug {
 		log.Debugf("Stream[%d] response: %v -> %v", id, req, res)
 	} else {
@@ -449,13 +497,13 @@ func (logger logger) OnStreamResponse(id int64, req *discovery.DiscoveryRequest,
 }
 
 // OnFetchRequest is called for each Fetch request
-func (logger logger) OnFetchRequest(_ context.Context, req *discovery.DiscoveryRequest) error {
+func (logger logger) OnFetchRequest(_ context.Context, req *discoverygrpc.DiscoveryRequest) error {
 	log.Infof("Fetch request: %v", req)
 	return nil
 }
 
 // OnFetchResponse is called immediately prior to sending a response.
-func (logger logger) OnFetchResponse(req *discovery.DiscoveryRequest, res *discovery.DiscoveryResponse) {
+func (logger logger) OnFetchResponse(req *discoverygrpc.DiscoveryRequest, res *discoverygrpc.DiscoveryResponse) {
 	if debug {
 		log.Debugf("Fetch response: %v -> %v", req, res)
 	} else {
@@ -520,14 +568,14 @@ func main() {
 	}
 
 	// Create and run our management server
-	srv := xds.NewServer(ctx, config, logger{})
+	srv := server.NewServer(ctx, config, nil)
 	runManagementServer(ctx, srv, port)
 	runMetricsServer(ctx, metricsServerAddr)
 
 	pid := os.Getpid()
 	file := "ecp.pid"
 	if err := ioutil.WriteFile(file, []byte(fmt.Sprintf("%v", pid)), 0644); err != nil {
-		log.Warnf("Cannot write PID-file %s for pid %d.", file, pid)
+		log.Warnf("Cannot write PID-file %s for pid %s.", file, pid)
 	} else {
 		log.WithFields(log.Fields{"pid": pid, "file": file}).Info("Wrote PID")
 	}
